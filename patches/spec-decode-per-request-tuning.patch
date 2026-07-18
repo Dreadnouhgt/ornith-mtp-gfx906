@@ -1,0 +1,97 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 3cb0876..9fb69b1 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1555,8 +1555,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 // add drafted token for each sequence
+                 const llama_token id = cur_p->data[0].id;
+ 
++                auto & dp = dparams.at(seq_id);
++
+                 // only collect very high-confidence draft tokens
+-                if (cur_p->data[0].p < params.p_min) {
++                const float p_min = dp.p_min >= 0.0f ? dp.p_min : params.p_min;
++                if (cur_p->data[0].p < p_min) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+ 
+@@ -1565,12 +1568,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 common_sampler_accept(smpl, id, true);
+ 
+-                auto & dp = dparams.at(seq_id);
+                 auto & result = *dp.result;
+ 
+                 result.push_back(id);
+ 
+-                if (params.n_max <= (int) result.size()) {
++                if (params.n_max <= (int) result.size() ||
++                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+diff --git a/common/speculative.h b/common/speculative.h
+index 062bf20..c864474 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -48,6 +48,10 @@ struct common_speculative_draft_params {
+ 
+     // the generated draft from the last _draft() call
+     llama_tokens * result;
++
++    // overrides the implementation's p_min (-1 disabled)
++    // note: kept last so aggregate initializers without it keep compiling
++    float p_min = -1.0f;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 7564ad4..1c52f31 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2956,13 +2956,16 @@ private:
+ 
+                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+ 
++                        const auto & spec_task = slot.task->params.speculative.draft;
++
+                         common_speculative_get_draft_params(spec.get(), slot.id) = {
+                             /* .drafting = */ true,
+-                            /* .n_max    = */ n_draft_max,
++                            /* .n_max    = */ spec_task.n_max > 0 ? std::min(n_draft_max, spec_task.n_max) : n_draft_max,
+                             /* .n_past   = */ slot.prompt.n_tokens(),
+                             /* .id_last  = */ slot.sampled,
+                             /* .prompt   = */ &slot.spec_prompt,
+                             /* .result   = */ &slot.spec_draft,
++                            /* .p_min    = */ spec_task.p_min,
+                         };
+ 
+                         drafting.push_back(&slot);
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 89026eb..4afb2cb 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -194,21 +194,19 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     // Speculative decoding params
+     //
+ 
+-    // TODO: to keep things simple, we disable speculative parameter adjustments for now
+-#if 0
+-    // TODO: for now, be able to adjust only the draft-model based speculative parameters
+     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
+         ->set_hard_limits(0, INT32_MAX)
+         ->set_desc("Maximum number of tokens to draft during speculative decoding"));
+ 
+     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
+         ->set_hard_limits(0, INT32_MAX)
+-        ->set_desc("Minimum number of draft tokens to use for speculative decoding");
++        ->set_desc("Minimum number of draft tokens to use for speculative decoding"));
+ 
+     add((new field_num("speculative.p_min", params.speculative.draft.p_min))
+         ->set_hard_limits(0.0f, 1.0f)
+         ->set_desc("Minimum speculative decoding probability for draft tokens (0 = greedy)"));
+ 
++#if 0
+     add((new field_str("speculative.type"))
+         ->set_desc("Speculative decoding method (for debugging and research purposes)")
+         ->set_handler([&](field_eval_context & ctx, const json & data) {

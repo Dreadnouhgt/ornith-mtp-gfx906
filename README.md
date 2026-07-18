@@ -13,8 +13,12 @@ the GGUF, and patched back into the GGUF in place.
 - an 858 MB donor GGUF you can graft onto your own Ornith quant.
 
 Result: **held-out next-next-token accuracy 80.1% -> 89.7%**, live draft
-acceptance at 32k context **57% -> 65-70%**, long-context throughput
-**~70 -> ~78 t/s**, with short/mid context at ~95/~104 t/s.
+acceptance at 32k context **57% -> 71%**, long-context throughput
+**~70 -> ~83 t/s**, with short/mid context at ~95/~105 t/s.
+
+A follow-up run (v3.1) scored *better* on held-out validation and *worse*
+live - see "Validation accuracy is not draft acceptance" below. It is the
+most useful thing in this repo if you are training one of these heads.
 
 ## Target hardware / stack
 
@@ -83,11 +87,19 @@ we hit were exactly these two terms.
 
 ## Pitfalls we hit (read before reproducing)
 
-- **Capture ubatch truncation**: llama.cpp's eval callback fires per
-  *ubatch* and the naive capture overwrites its buffers each time - with
-  the default `-ub 512`, every chunk longer than 512 tokens silently keeps
-  only the last ubatch's rows. Pass `-b`/`-ub` >= your chunk size and
-  verify `tokens == embd rows` per chunk (the capture script does).
+- **Capture ubatch truncation** (fixed in this repo's capture tool): the
+  eval callback fires per *ubatch*, and the original tool overwrote its
+  buffers each time, so any chunk longer than the ubatch silently kept
+  only the last ubatch's rows. The tool here accumulates instead, and
+  refuses to write a chunk whose captured rows do not match its token
+  count. Only `-b` must now be >= chunk size; `-ub` can stay small.
+- **The real long-context cap was the logits buffer.** Requesting logits
+  on every position (needed for `result_norm`) allocates
+  `n_tokens * n_vocab` floats - over 30 GB at 32k tokens with a 248k
+  vocab. Capturing `h_nextn` instead, which is emitted *before* the graph
+  filters rows down to requested outputs, means only the last position
+  needs logits. Verified: a 32,769-token chunk at `-ub 512` with 8 GB
+  peak host RAM, where 8k was previously the ceiling.
 - **mmap thrash on models larger than RAM**: loading a 36 GB GGUF with
   mmap on a 32 GB-RAM host looks like a hang (page cache thrashes,
   re-reading the file forever). `--no-mmap` loads it in ~45 s.
@@ -149,6 +161,73 @@ and disabling top-k is slower than the CPU top-k fallback.
   we shipped that bug briefly and it made per-request p_min a no-op)
 - enable the per-request `speculative.*` API fields (upstream has them
   `#if 0`-ed, with a stray syntax error inside)
+
+## Validation accuracy is not draft acceptance
+
+We trained a v3.1 head: two more epochs at half LR from v3. It improved
+every offline number and regressed every live one.
+
+| | held-out top-1 | live acc @512 | @8k | @32k |
+|---|---|---|---|---|
+| v3 | 89.7% | 74% | 93% | 71% |
+| v3.1 | **92.5%** | 73% | 88% | 68% |
+
+Measured A/B/A (v3, v3.1, v3) on one machine in one session; the two v3
+runs agreed to within 0.5%, so this is not drift.
+
+The cause is that the held-out chunks come from the *same corpus* as
+training - self-generated chat text. A second epoch pushed training-batch
+top-1 to 98-99% (memorization), which inflates same-distribution
+validation while hurting generalization to anything else. The live
+benchmark uses licence/documentation prose, i.e. out of distribution.
+
+Two rules came out of this, and they are why the repo is structured the
+way it is:
+
+1. **Select checkpoints by live draft acceptance**, not validation loss
+   or top-1.
+2. **Keep the benchmark text disjoint from the training corpus.** If you
+   train on the same text you benchmark on, you lose the only honest
+   signal you have.
+
+Position-bucketed validation was what made the problem legible - a single
+aggregate number hid it completely:
+
+| positions | v3 | v3.1 |
+|---|---|---|
+| <1k | 90.6% | 93.6% |
+| 1k-8k | 71.2% | 70.8% |
+| >8k | *no data* | *no data* |
+
+The `>8k` bucket being empty is the other lesson: we were serving at 32k
+while every training sample stopped at ~8k. The head was extrapolating,
+which is the likeliest cap on long-context acceptance.
+
+## A hybrid-model crash worth knowing about
+
+Ornith has delta-net **recurrent** layers alongside attention layers.
+Attention KV can be truncated to any prefix; recurrent state cannot be
+rewound. llama.cpp's server reuses a slot when a new prompt partially
+matches the cached one, removing the divergent suffix - and on this model
+that removal produces a GPU memory access fault:
+
+```
+slot get_availabl: selected slot by LCP similarity, sim_best = 0.488, f_keep = 0.009
+slot launch_slot_: task 19826 | processing task
+Memory access fault by GPU node-1 ... Reason: Page not present or supervisor privilege
+```
+
+It is not speculative-decoding related (reproduced with `--spec-type
+none`). It fires when *different* conversations share a slot; a single
+conversation growing monotonically is a pure prefix extension, removes
+nothing, and is safe - which is why normal single-user serving looks fine
+for hours.
+
+Mitigation that costs nothing: raise `--slot-prompt-similarity` (default
+0.10) to ~0.8 so a slot is only reused when the new prompt closely
+continues it. More server slots (`--parallel N`) also helps by giving
+concurrent conversations their own KV, but costs VRAM - on a 32 GB card
+serving a 36 GB model that tradeoff may not be available.
 
 ## Other drafters we tested (all lost to MTP)
 

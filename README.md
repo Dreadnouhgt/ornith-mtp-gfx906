@@ -8,6 +8,10 @@ directly against its **Q8_0 GGUF**, serving on retired-datacenter AMD
 the head is extracted from the GGUF, trained on hidden states captured from
 the GGUF, and patched back into the GGUF in place.
 
+**Trained head available on HuggingFace:**
+[Dreadbyte/Ornith-1.0-35B-MTP-head-v3-GGUF](https://huggingface.co/Dreadbyte/Ornith-1.0-35B-MTP-head-v3-GGUF)
+- an 858 MB donor GGUF you can graft onto your own Ornith quant.
+
 Result: **held-out next-next-token accuracy 80.1% -> 89.7%**, live draft
 acceptance at 32k context **57% -> 65-70%**, long-context throughput
 **~70 -> ~78 t/s**, with short/mid context at ~95/~104 t/s.
@@ -123,6 +127,31 @@ top-k (full-vocab CPU sampling is slower than the top-k fallback).
 
 If upstream ever makes HIP-graph capture shape-tolerant on gfx906 (or
 fixes the non-graph path), `patches/` is ready.
+
+## Other drafters we tested (all lost to MTP)
+
+Every speculative type this build supports, same model, greedy, by draft
+acceptance (deterministic; wall-clock drifts ~20% run to run):
+
+| drafter | 512 | 8k | 32k |
+|---|---|---|---|
+| **draft-mtp (n-max 2)** | **74%** | **93%** | **71%** |
+| draft-dflash (aeon) | 62% | 71% | 57% |
+| draft-dflash (zlab) | 62% | 62% | 21% |
+| ngram-simple | 11% | 54% | 50% |
+| ngram-mod | no drafts | 35% | no drafts |
+| draft-mtp + ngram-simple chained | 46% | 63% | 42% |
+
+Chaining ngram onto MTP *hurts*: the rejected ngram drafts burn
+verification budget. `draft-eagle3` is supported by the loader but needs
+an EAGLE3-format drafter trained for Ornith (3 extract layers, encoder
+mapping 3x2048 target features to the draft hidden size) - none exists yet.
+
+Note on gfx906 and drafting generally: Vega20 has no matrix/MFMA cores
+(those arrive with gfx908/CDNA), so batched draft verification is not
+close to free the way it is on tensor-core GPUs. Deep chains and tree
+drafting (EAGLE-2 style) pay off much less here, which is consistent with
+n-max 3+ only winning at mid context.
 
 ## Measured results (greedy, 2x Vega20, interleaved where possible)
 

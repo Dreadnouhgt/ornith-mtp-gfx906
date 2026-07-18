@@ -92,41 +92,63 @@ we hit were exactly these two terms.
   mmap on a 32 GB-RAM host looks like a hang (page cache thrashes,
   re-reading the file forever). `--no-mmap` loads it in ~45 s.
 - **Benchmark drift**: restart-to-restart throughput varies +-20% on this
-  stack. Only trust interleaved A/B on a single server instance.
+  stack, and the first config measured after the GPUs have been idle is
+  consistently the slowest. Draft *acceptance* is deterministic (identical
+  draft counts across repeats) - trust it over wall-clock, and bracket any
+  restart-based sweep with repeated baselines.
+- **A real llama.cpp bug, worth knowing if you benchmark**: on a freshly
+  loaded server, if the *first* request has `n_predict: 1` - which sets
+  `n_draft_max = n_remaining - 1 = 0` and so disables drafting - then the
+  next drafted request dies with a GPU memory access fault. Once the
+  server has served one normally-drafted request, the same sequence is
+  harmless. Our benchmark harness used exactly that as a cache-warming
+  call, which produced a string of "crashes" we initially misattributed
+  to HIP graphs. Do not use `n_predict: 1` to warm a fresh server.
 
-## Why we could not tune speculation further (gfx906-specific)
+## Speculative tuning on gfx906
 
-We wanted adaptive draft depth (`--spec-draft-p-min`, per-request
-`speculative.n_max`/`p_min`). The patches in `patches/` implement it
-correctly against `b10043`:
+**Correction (2026-07-18):** an earlier version of this README claimed that
+adaptive draft depth (`--spec-draft-p-min`) could not be used on gfx906
+because HIP-graph replay faulted on variable draft shapes. **That was
+wrong.** The faults came from a bug in our own benchmark harness (see
+below). Re-tested with a correct harness, `p_min` produces genuinely
+variable-length drafts with no faults at all.
 
-- fix: the draft-mtp implementation ignored the server's per-round draft
-  cap (`dp.n_max`) - every other speculative impl honors it
-- plumb `p_min` through the per-round draft params
+What p_min actually does here (greedy, 2x Vega20, draft acceptance):
+
+| config | 512 | 8k | 32k |
+|---|---|---|---|
+| n-max 2, p-min 0 (**production**) | 74% / ~95 t/s | 93% / ~105 t/s | 71% / ~83 t/s |
+| n-max 3, p-min 0 | 51% / ~85 t/s | 91% / **~117 t/s** | 39% / ~65 t/s |
+| n-max 3, p-min 0.6 | 82% / ~91 t/s | 83% / ~93 t/s | 65% / ~66 t/s |
+| n-max 4, p-min 0.75 | 87% / ~78 t/s | 83% / ~71 t/s | 79% / ~65 t/s |
+
+p_min does what it promises - it raises the *acceptance rate* by refusing
+low-confidence drafts - but on this hardware that does not convert into
+throughput: the drafts it skips were mostly ones the target would have
+accepted. Deeper chains (n-max 3) are a clear win at mid context
+(~117 vs ~105 t/s, reproduced three times) and a clear loss at 32k
+(~65 vs ~83). There is no single setting that wins everywhere, so the
+per-request `speculative.*` fields enabled by `patches/` are the sensible
+way to exploit this: pick the depth per request from the prompt length.
+
+`GGML_CUDA_FORCE_MMQ` and `GGML_CUDA_FORCE_CUBLAS` made no measurable
+difference. `-sm row` is unsupported (`ROCm0 does not support split
+buffers`), q8_0 KV cache + FA is slower (FA kernels are poor on gfx906),
+and disabling top-k is slower than the CPU top-k fallback.
+
+### The patches
+
+`patches/spec-decode-per-request-tuning.patch` against `b10043`:
+
+- **fix**: the `draft-mtp` implementation ignored the server's per-round
+  draft cap (`dp.n_max`); every other speculative implementation honors it
+- plumb `p_min` through the per-round draft params (note the sentinel:
+  the server's per-task default is `0.0f`, so the override test must be
+  `> 0`, not `>= 0`, or every request silently overrides the CLI value -
+  we shipped that bug briefly and it made per-request p_min a no-op)
 - enable the per-request `speculative.*` API fields (upstream has them
   `#if 0`-ed, with a stray syntax error inside)
-
-**They work, but you cannot deploy them on gfx906 today:**
-
-1. Variable-length drafts change the decode batch shape every round, and
-   **HIP-graph replay on gfx906 page-faults on shape changes** (GPU
-   memory access fault on the second differing decode). The unfixed
-   `dp.n_max` bug was accidentally load-bearing: constant-depth drafts
-   keep shapes constant, which is what keeps HIP graphs stable.
-2. The escape hatch, `GGML_CUDA_DISABLE_GRAPHS=1`, costs ~40% TG
-   (~104 -> ~68 t/s mid-context) - **and** the stock b10043 gfx906 binary
-   segfaults on the non-graph path for this workload anyway (reproduced
-   with the unpatched image).
-
-So on this stack it is HIP-graphs-with-constant-shapes or nothing. The
-practical optimum we landed on: `--spec-draft-n-max 2`, layer split,
-graphs on. A sweep of alternatives, all losers on gfx906: n-max 3 (wins
-only mid-context), q8_0 KV cache + FA (slower - FA kernels are bad on
-gfx906), row split (`ROCm0 does not support split buffers`), disabling
-top-k (full-vocab CPU sampling is slower than the top-k fallback).
-
-If upstream ever makes HIP-graph capture shape-tolerant on gfx906 (or
-fixes the non-graph path), `patches/` is ready.
 
 ## Other drafters we tested (all lost to MTP)
 

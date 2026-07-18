@@ -1,8 +1,8 @@
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 3cb0876..9fb69b1 100644
+index 3cb0876..53c4dcb 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -1555,8 +1555,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1555,8 +1555,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  // add drafted token for each sequence
                  const llama_token id = cur_p->data[0].id;
  
@@ -10,12 +10,14 @@ index 3cb0876..9fb69b1 100644
 +
                  // only collect very high-confidence draft tokens
 -                if (cur_p->data[0].p < params.p_min) {
-+                const float p_min = dp.p_min >= 0.0f ? dp.p_min : params.p_min;
++                // note: > 0, not >= 0 - the server's per-task default is 0.0f,
++                // so >= would make every request silently override the CLI value
++                const float p_min = dp.p_min > 0.0f ? dp.p_min : params.p_min;
 +                if (cur_p->data[0].p < p_min) {
                      drafting[seq_id] = false;
                      n_drafting--;
  
-@@ -1565,12 +1568,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1565,12 +1570,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
                  common_sampler_accept(smpl, id, true);
  

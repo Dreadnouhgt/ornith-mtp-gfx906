@@ -12,9 +12,16 @@ the GGUF, and patched back into the GGUF in place.
 [Dreadbyte/Ornith-1.0-35B-MTP-head-v3-GGUF](https://huggingface.co/Dreadbyte/Ornith-1.0-35B-MTP-head-v3-GGUF)
 - an 858 MB donor GGUF you can graft onto your own Ornith quant.
 
-Result: **held-out next-next-token accuracy 80.1% -> 89.7%**, live draft
-acceptance at 32k context **57% -> 71%**, long-context throughput
-**~70 -> ~83 t/s**, with short/mid context at ~95/~105 t/s.
+Result: **held-out next-next-token accuracy 80.1% -> 89.7%**, and at 32k
+context **+12 points of live draft acceptance (62% -> 74%) with ~11% more
+throughput**. Short and mid context are unchanged - the gain is entirely
+in long context, which is what it was trained for.
+
+All figures here are **greedy (`temperature: 0`)** and are means over three
+different prompt windows; see "Acceptance depends on content" for why both
+of those qualifiers matter. Note that if you serve with sampling (this
+deployment runs `temperature: 1`), llama.cpp uses rejection-based
+acceptance and your numbers will differ from these.
 
 A follow-up run (v3.1) scored *better* on held-out validation and *worse*
 live - see "Validation accuracy is not draft acceptance" below. It is the
@@ -328,17 +335,27 @@ not chase it; the most likely suspect is that checkpoint's YaRN rope
 config (`original_max_position_embeddings: 4096`, factor 64) interacting
 with deeper, more position-sensitive taps.
 
-## Measured results (greedy, 2x Vega20, interleaved where possible)
+## Measured results
 
-| ctx depth | before (v2 head) | after (v3 head) |
+Greedy (`temperature: 0`), 2x Vega20, both heads benchmarked in the same
+session, each number the mean of three different prompt windows:
+
+| ctx depth | v2 head (stock) | v3 head (this repo) |
 |---|---|---|
-| 512 | 96.9 t/s, 79% acc | ~88-95 t/s, 67-75% acc |
-| 8192 | 101.1 t/s, 95% acc | ~104 t/s, 95-97% acc |
-| 32768 | 69.9 t/s, 57% acc | ~78 t/s, 65-70% acc |
+| 512 | 75% acc, 80.0 t/s | 75% acc, 80.2 t/s |
+| 8192 | 76% acc, 76.2 t/s | 75% acc, 76.4 t/s |
+| 32768 | 62% acc, 63.6 t/s | **74% acc, 70.4 t/s** |
 
-The v3 training corpus leaned long-context (that was the target); the
-small short-context regression should recover with one rebalanced epoch
-(`resume.pt` support is in the trainer).
+Per-window spread at 32k was 43/84/59% for v2 and 71/86/64% for v3 - which
+is why single-window numbers are not reported here.
+
+**Correction.** Earlier versions of this README claimed 57% -> 71% at 32k
+with short/mid context at 95/105 t/s. Those mixed measurement conditions:
+the v2 baseline had been measured at `temperature: 0.7` while the v3
+figures were greedy, and every figure came from a single prompt window.
+Re-measured under matched conditions, the long-context gain is real and
+slightly smaller, and the apparent short-context regression disappears
+entirely - it was window selection, not the model.
 
 ## Repro sketch
 

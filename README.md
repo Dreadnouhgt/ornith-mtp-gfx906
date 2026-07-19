@@ -297,11 +297,42 @@ conversation growing monotonically is a pure prefix extension, removes
 nothing, and is safe - which is why normal single-user serving looks fine
 for hours.
 
-Mitigation that costs nothing: raise `--slot-prompt-similarity` (default
-0.10) to ~0.8 so a slot is only reused when the new prompt closely
-continues it. More server slots (`--parallel N`) also helps by giving
-concurrent conversations their own KV, but costs VRAM - on a 32 GB card
-serving a 36 GB model that tradeoff may not be available.
+**`--slot-prompt-similarity` does not fix this.** An earlier version of this
+README recommended raising it from 0.10 to ~0.8. That was wrong, and we
+left it deployed for a day before catching it. The threshold filters on how
+*similar* the prompts are, but what actually breaks the model is any KV
+*removal* at all - we observed a fault at:
+
+```
+selected slot by LCP similarity, sim_best = 0.830 (> 0.800 thold), f_keep = 0.976
+Memory access fault by GPU node-1 ... Page not present
+```
+
+The server kept **97.6%** of the cache and the 2.4% it dropped was still
+fatal. No similarity threshold prevents that, because multi-turn chat
+produces divergence structurally: each turn re-renders the template, so the
+previous turn's `<|im_start|>assistant\n<think>\n` generation suffix is
+replaced by real assistant text and the tail always differs.
+
+What actually works:
+
+- **Erase the slot** (`POST /slots/N?action=erase`) before any request that
+  is not a continuation of what that slot already holds. This is what we do,
+  and it eliminated the faults entirely.
+- **Do not pre-warm slots with a saved prefix.** We ran a sidecar that
+  restored a 1.5k-token system+tools prefix into slot 0 on every server
+  start. Every subsequent request shared that prefix and then diverged -
+  which is exactly the fatal pattern. Disabling it cost 3.8s of prompt
+  processing on the first message of a conversation and stopped the crashes.
+  Follow-up turns still hit the cache normally (68ms), because those are
+  pure prefix extensions, which remove nothing and are safe.
+- More slots (`--parallel N`) reduces how often unrelated conversations
+  collide on one slot, but does not make removal safe, and costs VRAM you
+  may not have when a 36 GB model sits on 2x32 GB cards.
+
+The real fix belongs upstream: llama.cpp should either refuse partial reuse
+for models with recurrent layers, or rebuild the recurrent state after a
+removal.
 
 ## Other drafters we tested (all lost to MTP)
 

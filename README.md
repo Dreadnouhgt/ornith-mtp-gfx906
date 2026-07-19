@@ -236,23 +236,61 @@ acceptance (deterministic; wall-clock drifts ~20% run to run):
 
 | drafter | 512 | 8k | 32k |
 |---|---|---|---|
-| **draft-mtp (n-max 2)** | **74%** | **93%** | **71%** |
-| draft-dflash (aeon) | 62% | 71% | 57% |
+| **draft-mtp (n-max 2)** | **74%** | 93% | **71%** |
+| draft-dflash (aeon, layer ids fixed) | 66% | **96%** | 31% |
+| draft-dflash (aeon, as originally converted) | 62% | 71% | 57% |
 | draft-dflash (zlab) | 62% | 62% | 21% |
+| ngram-map-k4v | 6% | 71% | 50% |
+| ngram-map-k | 6% | 61% | 50% |
 | ngram-simple | 11% | 54% | 50% |
+| ngram-cache | 28% | 67% | 23% |
 | ngram-mod | no drafts | 35% | no drafts |
 | draft-mtp + ngram-simple chained | 46% | 63% | 42% |
+
+MTP still wins overall. Note that dflash *beats* it on acceptance at 8k
+(96% vs 93%) yet ties on throughput (106 vs 105 t/s): each dflash draft
+costs a full ~700M-parameter forward pass, which cancels the benefit of
+proposing 15 tokens in one shot. On this hardware the autoregressive MTP
+head - a single extra block reusing the target's own LM head - is simply
+cheaper per proposed token.
 
 Chaining ngram onto MTP *hurts*: the rejected ngram drafts burn
 verification budget. `draft-eagle3` is supported by the loader but needs
 an EAGLE3-format drafter trained for Ornith (3 extract layers, encoder
 mapping 3x2048 target features to the draft hidden size) - none exists yet.
 
-Note on gfx906 and drafting generally: Vega20 has no matrix/MFMA cores
-(those arrive with gfx908/CDNA), so batched draft verification is not
-close to free the way it is on tensor-core GPUs. Deep chains and tree
-drafting (EAGLE-2 style) pay off much less here, which is consistent with
-n-max 3+ only winning at mid context.
+### DFlash GGUF conversion: the target-layer off-by-one
+
+If you convert a DFlash checkpoint to GGUF yourself, this will cost you a
+lot of acceptance and give you no hint why.
+
+HuggingFace DFlash checkpoints list `target_layer_ids` in *HF* semantics:
+the reference implementation reads `hidden_states[layer_id + 1]`, which is
+the residual stream **after** target layer `layer_id`. llama.cpp instead
+taps `layer_inp(N)` - the input **to** layer `N` - and passes the GGUF
+`dflash.target_layers` values through verbatim (`src/models/dflash.cpp`
+reads them, `common/speculative.cpp` hands them straight to
+`llama_set_embeddings_layer_inp`). Neither side adds an offset.
+
+So the GGUF must contain **HF `target_layer_ids` + 1**. Write the raw HF
+values and every feature tap reads one layer too shallow. The drafter
+still loads, still produces fluent proposals, and quietly gives up a large
+chunk of its acceptance:
+
+| aeon drafter | 512 | 8k | 32k |
+|---|---|---|---|
+| raw HF ids (wrong) | 62% | 71% | 57% |
+| ids + 1 (correct) | 66% | **96%** | 31% |
+
+Twenty-five points of acceptance at 8k. `patches/convert_aeon_dflash_to_gguf_fixed.py`
+shows the one-line difference. Verify by checking the server log line
+`DFlash extract_layers = [...]` against your checkpoint's config plus one.
+
+The 32k regression in that table is real and reproducible in-session, not
+drift - the uncorrected build reproduced its 57% in the same run. We did
+not chase it; the most likely suspect is that checkpoint's YaRN rope
+config (`original_max_position_embeddings: 4096`, factor 64) interacting
+with deeper, more position-sensitive taps.
 
 ## Measured results (greedy, 2x Vega20, interleaved where possible)
 

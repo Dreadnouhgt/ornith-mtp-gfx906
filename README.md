@@ -12,9 +12,12 @@ the GGUF, and patched back into the GGUF in place.
 - see "Distil from the target, not the corpus" below. It beat a day of data
 work, config tuning and alternative drafters, and it is about ten lines.
 
-**Trained head available on HuggingFace:**
+**Trained heads available on HuggingFace:**
 [Dreadbyte/Ornith-1.0-35B-MTP-head-v3-GGUF](https://huggingface.co/Dreadbyte/Ornith-1.0-35B-MTP-head-v3-GGUF)
-- an 858 MB donor GGUF you can graft onto your own Ornith quant.
+- 858 MB donor GGUFs you can graft onto your own Ornith quant. Use
+`ornith-1.0-35b-MTP-head-v31-distill-Q8_0.gguf` (the distillation-trained
+head, what we run in production); the `v3` file is the earlier
+corpus-CE head, kept for comparison.
 
 Result: **held-out next-next-token accuracy 80.1% -> 89.7%**, and at 32k
 context **+12 points of live draft acceptance (62% -> 74%) with ~11% more
@@ -213,7 +216,10 @@ configuration knob or alternative drafter beat the baseline at all. Changing
 what the loss optimises did.
 
 Credit for this belongs to a collaborator who ran it on a DGX Spark and sent
-back the checkpoint plus the diff.
+back the checkpoint plus the diff. The resulting head is published as
+`ornith-1.0-35b-MTP-head-v31-distill-Q8_0.gguf` on the HuggingFace repo
+linked above, and is what this deployment now serves: measured live at
+**~99 t/s at 3k context and ~86 t/s at 30k**.
 
 **If you sample rather than decode greedily**, hard argmax is the wrong
 teacher: acceptance is then probabilistic against the target's *distribution*,

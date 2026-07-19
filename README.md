@@ -247,12 +247,48 @@ acceptance (deterministic; wall-clock drifts ~20% run to run):
 | ngram-mod | no drafts | 35% | no drafts |
 | draft-mtp + ngram-simple chained | 46% | 63% | 42% |
 
-MTP still wins overall. Note that dflash *beats* it on acceptance at 8k
-(96% vs 93%) yet ties on throughput (106 vs 105 t/s): each dflash draft
-costs a full ~700M-parameter forward pass, which cancels the benefit of
-proposing 15 tokens in one shot. On this hardware the autoregressive MTP
-head - a single extra block reusing the target's own LM head - is simply
-cheaper per proposed token.
+MTP wins overall. **Read the caveat below before trusting any single cell
+in that table**: every number there is one prompt window per depth, and
+content variance between windows is larger than most of the differences.
+The one comparison we measured properly - five distinct 32k windows -
+gives MTP 70.6% mean vs dflash 48.6%, with MTP ahead on every window.
+
+dflash's apparent 8k win (96% vs 93%) is *not* real: a 3-point gap on a
+single window, against content noise of +-20 points. What does survive is
+throughput parity at best (106 vs 105 t/s) despite dflash proposing 15
+tokens per pass, because each of its drafts costs a full ~700M-parameter
+forward. On this hardware the autoregressive MTP head - one extra block
+reusing the target's own LM head - is simply cheaper per proposed token.
+
+### Acceptance depends on content far more than on position
+
+Testing five different 32k windows of the same benchmark corpus:
+
+| 32k window | dflash (fixed) | MTP |
+|---|---|---|
+| 0 | 31% | 79% |
+| 40k | 50% | 59% |
+| 80k | 76% | 86% |
+| 120k | 51% | 65% |
+| 160k | 35% | 64% |
+| **mean** | **48.6%** | **70.6%** |
+
+A 45-point spread for dflash and 27 for MTP, from content alone. Block
+drafters are hit hardest: proposing 15 tokens at once is all-or-nothing,
+so repetitive boilerplate scores brilliantly and varied prose collapses.
+
+Two practical consequences:
+
+1. **A single-prompt benchmark is reproducible but not representative.**
+   Greedy decoding on a fixed prompt reproduces to the token across runs
+   and even across days - which makes it feel trustworthy while it is
+   silently measuring one sample. Report means over several windows before
+   claiming a drafter difference smaller than ~20 points.
+2. **Depth ladders confound position with content.** We briefly believed
+   this drafter had a long-context failure because acceptance ran
+   32%/96%/42%/83%/31% across 4k/8k/16k/24k/32k. That is not a positional
+   effect - a rope or extrapolation problem degrades monotonically. It was
+   five different texts.
 
 Chaining ngram onto MTP *hurts*: the rejected ngram drafts burn
 verification budget. `draft-eagle3` is supported by the loader but needs

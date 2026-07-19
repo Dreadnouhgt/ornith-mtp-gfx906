@@ -8,6 +8,10 @@ directly against its **Q8_0 GGUF**, serving on retired-datacenter AMD
 the head is extracted from the GGUF, trained on hidden states captured from
 the GGUF, and patched back into the GGUF in place.
 
+**The single highest-value change in this repo is the training objective**
+- see "Distil from the target, not the corpus" below. It beat a day of data
+work, config tuning and alternative drafters, and it is about ten lines.
+
 **Trained head available on HuggingFace:**
 [Dreadbyte/Ornith-1.0-35B-MTP-head-v3-GGUF](https://huggingface.co/Dreadbyte/Ornith-1.0-35B-MTP-head-v3-GGUF)
 - an 858 MB donor GGUF you can graft onto your own Ornith quant.
@@ -168,6 +172,69 @@ and disabling top-k is slower than the CPU top-k fallback.
   we shipped that bug briefly and it made per-request p_min a no-op)
 - enable the per-request `speculative.*` API fields (upstream has them
   `#if 0`-ed, with a stray syntax error inside)
+
+## Distil from the target, not the corpus
+
+Our trainer originally minimised cross-entropy against the **corpus** token,
+`tokens[i+2]`. That is not what speculative decoding tests. Acceptance asks
+whether the draft matches **what the target model itself would emit** - and
+those differ on every token where the target would not have produced the
+corpus token.
+
+The captures already contain the fix. `result_norm[i+1]` is the target's own
+final hidden state for position `i+2`, so:
+
+```python
+teacher = (h_next.to(torch.bfloat16) @ lm_head.t()).argmax(-1)   # target's own next-next token
+loss    = F.cross_entropy(draft_logits, teacher)                 # instead of the corpus token
+```
+
+`code/train_mtp_distill.py` and `code/dataset_distill.py` are the ~10-line
+change (the loader additionally yields `h_next = result_norm[i+1]`).
+No new data, no architecture change.
+
+Measured against the previous head, greedy, same session, on both benchmarks
+(acceptance reproduced identically across sessions for both heads):
+
+| benchmark | corpus-CE head | **distilled head** |
+|---|---|---|
+| ECHO-shaped, ~2.5k ctx | 76% | **80%** |
+| ECHO-shaped, ~9k | 68% | **75%** |
+| ECHO-shaped, ~16k | 75% | **78%** |
+| ECHO-shaped, ~30k | 67% | **69%** |
+| licence prose, 512 | 75% | **76%** |
+| licence prose, 8k | 75% | **78%** |
+| licence prose, 32k | 74% | 74% |
+
+For context on how much that is worth: retraining on 1.4M tokens of new
+long-context data (v4) moved nothing and regressed 32k badly; two more epochs
+on the original objective (v3.1) regressed live acceptance outright; and no
+configuration knob or alternative drafter beat the baseline at all. Changing
+what the loss optimises did.
+
+Credit for this belongs to a collaborator who ran it on a DGX Spark and sent
+back the checkpoint plus the diff.
+
+**If you sample rather than decode greedily**, hard argmax is the wrong
+teacher: acceptance is then probabilistic against the target's *distribution*,
+so soft-KL distillation fits better. We measure greedy, so argmax is correct
+here - resolve this for your own serving mode before copying the objective.
+
+## An ECHO-shaped benchmark (why the licence corpus is not enough)
+
+`code/echo_bench_build.py` builds a frozen benchmark from what this
+deployment actually serves: the real system prompt and tool schemas (read out
+of the live slot cache), realistic multi-turn tool-calling conversations, and
+large tool payloads - 12 prompts at roughly 2.5k, 9k, 16k and 30k tokens,
+three each.
+
+It matters because acceptance is content-dependent, and the two benchmarks do
+not agree: the distilled head gains +7 points at ~9k of ECHO-shaped traffic
+but only +3 on licence prose at 8k. Long conversations get long through tool
+output, not through model prose, so the benchmark builds them that way.
+
+Prompts are generated once and frozen as token sequences, so every future run
+replays byte-identical inputs.
 
 ## Validation accuracy is not draft acceptance
 

@@ -60,15 +60,23 @@ static int parse_layer_from_name(const char * name) {
     return atoi(name + sizeof(prefix) - 1);
 }
 
+// Appends this ubatch's rows to buf rather than replacing them. The callback
+// fires once per ubatch; the original replaced the buffer each time, so any
+// chunk longer than one ubatch silently kept only its final ubatch. Callers
+// clear the buffers between chunks, and llama.cpp emits ubatches in position
+// order for a single-sequence causal prefill, so appending reconstructs the
+// full chunk and decouples chunk size from -ub.
 static void fill_f32_buf(struct ggml_tensor * t, std::vector<float> & buf) {
     const int64_t n_elts = t->ne[0] * t->ne[1];
-    buf.resize((size_t) n_elts);
+    const size_t  off    = buf.size();
+    buf.resize(off + (size_t) n_elts);
+    float * dst = buf.data() + off;
 
     const bool is_host = ggml_backend_buffer_is_host(t->buffer);
     if (is_host && t->type == GGML_TYPE_F32) {
-        memcpy(buf.data(), t->data, buf.size() * sizeof(float));
+        memcpy(dst, t->data, (size_t) n_elts * sizeof(float));
     } else if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+        ggml_backend_tensor_get(t, dst, 0, (size_t) n_elts * sizeof(float));
     } else {
         std::vector<uint8_t> raw(ggml_nbytes(t));
         if (is_host) {
@@ -78,9 +86,9 @@ static void fill_f32_buf(struct ggml_tensor * t, std::vector<float> & buf) {
         }
         for (int64_t i = 0; i < n_elts; ++i) {
             if (t->type == GGML_TYPE_F16) {
-                buf[i] = ggml_fp16_to_fp32(((const ggml_fp16_t *) raw.data())[i]);
+                dst[i] = ggml_fp16_to_fp32(((const ggml_fp16_t *) raw.data())[i]);
             } else if (t->type == GGML_TYPE_BF16) {
-                buf[i] = ggml_bf16_to_fp32(((const ggml_bf16_t *) raw.data())[i]);
+                dst[i] = ggml_bf16_to_fp32(((const ggml_bf16_t *) raw.data())[i]);
             } else {
                 GGML_ABORT("unsupported hidden-state tensor type for capture");
             }
@@ -112,7 +120,7 @@ static bool capture_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) 
     }
 
     st->n_embd = t->ne[0];
-    st->n_tok  = t->ne[1];
+    st->n_tok += t->ne[1];   // accumulates across ubatches; reset per chunk
 
     if (is_extra) {
         fill_f32_buf(t, st->extra_data[t->name]);
@@ -221,6 +229,7 @@ int main(int argc, char ** argv) {
 
         st.layer_data.clear();
         st.extra_data.clear();
+        st.n_tok = 0;
         if (llama_decode(ctx, batch) != 0) {
             LOG_ERR("decode failed on chunk %d, skipping\n", chunk_idx);
             llama_batch_free(batch);
@@ -232,6 +241,30 @@ int main(int argc, char ** argv) {
             LOG_ERR("chunk %d: expected %zu captured layers, got %zu, skipping\n",
                      chunk_idx, st.target_layers.size(), st.layer_data.size());
             continue;
+        }
+
+        // Every captured buffer must hold exactly one row per token. A short
+        // buffer means ubatches were dropped rather than accumulated, which
+        // would poison training data silently — refuse to write it.
+        {
+            const size_t want = tokens.size() * (size_t) st.n_embd;
+            bool bad = false;
+            for (int il : st.target_layers) {
+                if (st.layer_data[il].size() != want) {
+                    LOG_ERR("chunk %d: layer %d has %zu floats, expected %zu — skipping chunk\n",
+                            chunk_idx, il, st.layer_data[il].size(), want);
+                    bad = true;
+                }
+            }
+            for (const auto & name : st.extra_names) {
+                auto it = st.extra_data.find(name);
+                if (it != st.extra_data.end() && it->second.size() != want) {
+                    LOG_ERR("chunk %d: extra '%s' has %zu floats, expected %zu — skipping chunk\n",
+                            chunk_idx, name.c_str(), it->second.size(), want);
+                    bad = true;
+                }
+            }
+            if (bad) continue;
         }
 
         std::vector<int32_t> tok_i32(tokens.begin(), tokens.end());

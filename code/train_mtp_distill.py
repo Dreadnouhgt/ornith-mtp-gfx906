@@ -25,7 +25,7 @@ import torch.nn.functional as F
 sys.path.insert(0, "/work")
 from mtp_module import MTPBlock
 from dataset import iter_chunks
-from dataset_v31 import chunk_samples_v31
+from dataset_distill import chunk_samples_v31
 
 WORK = "/work"
 DATA_DIRS = ["/data/captured-mtp-v2", "/data/captured-mtp-v3"]

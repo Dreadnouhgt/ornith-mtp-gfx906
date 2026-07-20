@@ -81,9 +81,35 @@ Q8_0 on GB10 vs gfx906, same corpus line: token ids + raw embeddings
 rows that vary run-to-run on the same hardware (top-8-of-256 routing flips on
 near-tie router scores — nondeterminism, not platform skew).
 
-## Next lever (measured, not started)
+## Live A/B verdict (2026-07-20, 2x MI50, ECHO bench) — hypothesis falsified
 
-Prefix survival at k=4 went 10.5%→19.9% in one epoch and hasn't plateaued:
-train deeper than served (N_STEPS 6–8) on the fused module (~1 h/epoch now).
-Measured dead ends: more corpus data (+0.34), KL (≤0.8 ceiling), extra polish
-epochs (+0.1).
+The gfx906 A/B of v3.3-e0 contradicted the n-max recommendation above, in two
+independent ways:
+
+1. **Deeper drafts don't pay on this hardware regardless of head quality.**
+   n-max 4 halves throughput (~90 → ~45 t/s at every context length); n-max 3
+   is flat-to-negative. Each draft step is a separate batch-1 `llama_decode`
+   of the head, and its fixed per-decode cost dominates whatever the extra
+   survival buys. The tokens/cycle table above modelled the benefit and
+   hand-waved this cost; the cost is the whole game. **n-max 2 stays.**
+   Corollary: training still-deeper chains (a 6–8-step v3.4 was the planned
+   next run) has no cash-out path here and is cancelled.
+2. **The proxy missed a live step-1 regression.** The held-out proxy said
+   v3.3's step-1 acceptance was flat vs v3.2; live at n-max 2 it is
+   −7.6/−9.2 pp at short/mid context vs deployed v3.1-distill — while gaining
+   +3.2/+6.3 pp at 16k/30k. The clean-split evals fix train/val
+   *contamination* but not *distribution* mismatch: the held-out chunks are
+   self-generated chat prose, the live bench is tool-call/payload-heavy.
+   This repo's own "validation accuracy is not draft acceptance" lesson,
+   re-confirmed from the other side. Open question (isolable by benching the
+   v3.2 GGUF): whether the short-context dip is v3.3's or inherited from
+   v3.2, where the 3x self-generated data entered.
+
+v3.3-e0 is not deployed. What survives: the long-context gains at n-max 2,
+the per-step measurement methodology, the fused MoE, and the capture fix.
+Structural fix before any further training: build the offline eval from
+ECHO-shaped captures so proxy numbers predict live ones.
+
+Still-standing measured dead ends: more corpus data (+0.34), KL (≤0.8
+ceiling), extra polish epochs (+0.1). The earlier recommendation here to
+train N_STEPS 6–8 is withdrawn per the live verdict.

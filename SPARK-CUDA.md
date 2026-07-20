@@ -113,3 +113,46 @@ ECHO-shaped captures so proxy numbers predict live ones.
 Still-standing measured dead ends: more corpus data (+0.34), KL (≤0.8
 ceiling), extra polish epochs (+0.1). The earlier recommendation here to
 train N_STEPS 6–8 is withdrawn per the live verdict.
+
+## Cross-hardware live bench (GB10, 2026-07-20 late)
+
+The offline proxies failed to reproduce the live ordering even on captures of
+the exact ECHO token ids — generation-time acceptance is a different
+measurement. So the bench itself was replicated on a Spark: stock HF GGUF +
+the published donor heads grafted in (`code/graft_mtp_head.py` — the donor is
+not loadable standalone as `-md`; grafting also needs
+`<arch>.nextn_predict_layers=1` and `block_count` 40→41, since the loader
+takes nextn from `blk.(block_count-1)`), then josh's exact protocol (frozen
+prompts, erase slot, n_predict 192, greedy, `timings.draft_n_accepted/draft_n`,
+n-max 2, hardened flags).
+
+GB10 acceptance / t/s:
+
+| head | short | medium | long | xlong |
+|---|---|---|---|---|
+| v3 | 69.9% / 72.1 | 72.8% / 68.8 | 68.7% / 65.2 | 74.1% / 65.0 |
+| v3.1-distill | 74.3% / 74.0 | 76.0% / 71.7 | 71.2% / 66.5 | 74.3% / 64.8 |
+| v3.2 | 73.6% / 72.9 | 75.5% / 71.2 | 72.5% / 67.5 | 75.6% / 65.8 |
+| v3.3-e0 | 73.9% / 74.6 | **77.0%** / 71.0 | **75.2%** / 67.5 | **77.6%** / 66.8 |
+| v3.3-e1 | 72.4% / 75.0 | 77.0% / 72.4 | 74.5% / 67.6 | 77.5% / 67.7 |
+
+Versus the MI50 results: xlong ordering matches exactly (v33 > v32 > v31),
+long broadly, v3.1's short-context strength on both — but **the medium bucket
+contradicts outright**: the MI50's largest v3.3 regression (−9.2 pp) is a
++1 pp win on GB10. Same tokens, same build, same protocol; the difference is
+backend numerics (top-8-of-256 routing near-ties resolve differently per
+stack, compounding through draft-vs-target agreement).
+
+Consequences:
+
+- **Acceptance ordering is partially hardware-dependent.** A CUDA bench is a
+  useful screen but cannot arbitrate the MI50 short/medium regression; the
+  serving box stays the only authority for its own deployment.
+- **On CUDA, v3.3-e0 is the best head across the board** (best/tied
+  acceptance in all four buckets, best/near-best t/s). The head-quality
+  verdict itself is backend-dependent.
+- v3.3-e1 benched equal-or-worse than e0 live (−1.5 pp short, ties
+  elsewhere) despite marginally better proxy numbers — not shipped; e0
+  remains the v3.3 of record.
+- GB10 serves this Q8 model at 65–75 t/s vs the MI50s' 80–98 — the
+  memory-bandwidth gap (273 GB/s LPDDR5X vs ~1 TB/s HBM2), measured in vivo.

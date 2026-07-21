@@ -169,6 +169,12 @@ int main(int argc, char ** argv) {
     for (int l : st.target_layers) LOG_INF(" %d", l);
     LOG_INF("\n");
 
+    const char * ids_env = getenv("HIDDEN_CAPTURE_CORPUS_IS_IDS");
+    const bool corpus_is_ids = ids_env && atoi(ids_env) != 0;
+    if (corpus_is_ids) {
+        LOG_INF("hidden-capture: corpus lines are token ids, skipping tokenization\n");
+    }
+
     int mask_token_id = -1;
     if (const char * mt = getenv("HIDDEN_CAPTURE_MASK_TOKEN_ID")) {
         mask_token_id = atoi(mt);
@@ -205,7 +211,18 @@ int main(int argc, char ** argv) {
     while (std::getline(corpus, line)) {
         if (line.empty()) continue;
 
-        std::vector<llama_token> tokens = common_tokenize(ctx, line, add_bos, true);
+        // HIDDEN_CAPTURE_CORPUS_IS_IDS=1: each corpus line is space-separated
+        // token ids instead of text — for benching the exact token sequences a
+        // live server was measured on (detokenize->retokenize does not
+        // round-trip reliably through chat-template special tokens).
+        std::vector<llama_token> tokens;
+        if (corpus_is_ids) {
+            std::stringstream ls(line);
+            long v;
+            while (ls >> v) tokens.push_back((llama_token) v);
+        } else {
+            tokens = common_tokenize(ctx, line, add_bos, true);
+        }
         if ((int) tokens.size() > chunk_tokens) {
             tokens.resize(chunk_tokens);
         }

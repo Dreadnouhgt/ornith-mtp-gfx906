@@ -113,3 +113,67 @@ ECHO-shaped captures so proxy numbers predict live ones.
 Still-standing measured dead ends: more corpus data (+0.34), KL (≤0.8
 ceiling), extra polish epochs (+0.1). The earlier recommendation here to
 train N_STEPS 6–8 is withdrawn per the live verdict.
+
+## Cross-hardware live bench (GB10)
+
+The offline proxies never reproduced the live ordering (even on captures of the
+exact ECHO token ids — generation-time acceptance is a different measurement),
+so the live bench itself was replicated on a DGX Spark: stock HF GGUF + the
+published donor heads grafted in (`code/graft_mtp_head.py` — the donor is not
+loadable standalone as `-md`; grafting also needs `<arch>.nextn_predict_layers=1`
+and `block_count` 40->41, since the loader reads nextn from `blk.(block_count-1)`),
+then the ECHO protocol (`code/bench_live.py`: erase slot, n_predict 192, greedy,
+`timings.draft_n_accepted/draft_n`, n-max 2, hardened flags).
+
+GB10 acceptance / t/s (n-max 2):
+
+| head | short | medium | long | xlong |
+|---|---|---|---|---|
+| v3 | 69.9% / 72.1 | 72.8% / 68.8 | 68.7% / 65.2 | 74.1% / 65.0 |
+| v3.1-distill | 74.3% / 74.0 | 76.0% / 71.7 | 71.2% / 66.5 | 74.3% / 64.8 |
+| v3.2 | 73.6% / 72.9 | 75.5% / 71.2 | 72.5% / 67.5 | 75.6% / 65.8 |
+| v3.3-e0 | 73.9% / 74.6 | **77.0%** / 71.0 | **75.2%** / 67.5 | **77.6%** / 66.8 |
+
+Versus the MI50: xlong ordering matches exactly (v33 > v32 > v31), long broadly,
+v3.1's short-context strength on both — **but the medium bucket contradicts
+outright**: your largest v3.3 regression (-9.2 pp) is a +1 pp win here. Same
+tokens, same build, same protocol; the difference is backend numerics
+(top-8-of-256 routing near-ties resolve differently per stack). So:
+
+- **Acceptance ordering is partially hardware-dependent.** A CUDA bench screens
+  but cannot arbitrate the MI50 short/medium result — your box stays the only
+  authority for your deployment.
+- **On CUDA, v3.3-e0 is the best head across the board.** The head-quality
+  verdict itself is backend-dependent.
+- GB10 serves this Q8 model at 65-75 t/s vs the MI50s' 80-98 (273 GB/s LPDDR5X
+  vs ~1 TB/s HBM2) — measured in vivo.
+
+## Night 2: three data-composition hypotheses, all falsified
+
+With the fused module (epochs <1 h) three more heads chased v3.3's short/medium
+dip. GB10 live bench, n-max 2:
+
+| head | short | medium | long | xlong | what it was |
+|---|---|---|---|---|---|
+| v3.3-e0 | 73.9 | 77.0 | 75.2 | 77.6 | still best CUDA head |
+| v3.3-e1 | 72.4 | 77.0 | 74.5 | 77.5 | 2nd epoch, diminishing |
+| v3.3b | 73.2 | 76.8 | 71.1 | 75.4 | recurrence from clean v3.1 parent, no v4 data |
+| v3.5 | 70.0 | 75.4 | 72.2 | 78.4 | v3.3-e0 + ECHO-shaped training data (3x) |
+
+- **v3.3b** dropped the v4 self-generated data to fix short -> also lost the
+  long/xlong gains (the v4 data is load-bearing) without recovering short.
+- **v3.5** added a synthetic ECHO-shaped corpus (`code/gen_echo_corpus.py`:
+  production system+tools prefix, tool-call structure, RNG payloads,
+  model-generated `<think>`; captured via the new `HIDDEN_CAPTURE_CORPUS_IS_IDS`
+  mode, seed-disjoint from the frozen bench) to train the serving distribution
+  -> short got **worse** (73.9->70.0), only xlong nudged up.
+
+**Bracketed conclusion:** the short/medium regression is not fixable by data
+composition — removing v4 loses long context, adding distribution-matched data
+regresses short. It looks intrinsic to the recurrence objective or the v3.2
+lineage. The next genuinely different lever is architectural (an EAGLE3-format
+drafter — none exists for Ornith yet), not more MTP-head training. Caveat: our
+ECHO corpus is *synthetic* (matches your bench's structure, not its real
+content), so "distribution-matching fails" vs "our synthetic distribution was
+wrong" can't be separated without real production traffic. Checkpoints for MI50
+validation: shared drive `mtp-night2-spark/`.
